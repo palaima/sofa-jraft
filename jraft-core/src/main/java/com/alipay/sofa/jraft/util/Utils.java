@@ -251,9 +251,16 @@ public final class Utils {
         // Note: may fail in some JVM implementations
         // therefore fallback has to be provided
 
-        // something like '<pid>@<hostname>', at least in SUN / Oracle JVMs
-        final String jvmName = ManagementFactory.getRuntimeMXBean().getName();
-        final int index = jvmName.indexOf('@');
+        final int index;
+        final String jvmName;
+        try {
+            // something like '<pid>@<hostname>', at least in SUN / Oracle JVMs
+            jvmName = ManagementFactory.getRuntimeMXBean().getName();
+            index = jvmName.indexOf('@');
+        } catch (Exception e) {
+            // ignore
+            return fallback;
+        }
 
         if (index < 1) {
             // part before '@' empty (index = 0) / '@' not found (index = -1)
