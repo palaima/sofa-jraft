@@ -254,10 +254,11 @@ public final class Utils {
         final int index;
         final String jvmName;
         try {
+            Class.forName("java.lang.management.ManagementFactory");
             // something like '<pid>@<hostname>', at least in SUN / Oracle JVMs
             jvmName = ManagementFactory.getRuntimeMXBean().getName();
             index = jvmName.indexOf('@');
-        } catch (Exception e) {
+        } catch (final Throwable t) {
             // ignore
             return fallback;
         }
