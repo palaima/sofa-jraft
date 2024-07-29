@@ -164,7 +164,7 @@ public abstract class AbstractFile extends ReferenceResource {
                     this.mappedByteBuffer.force();
                     this.flushedPosition.set(getWrotePosition());
                     if (this.mappedByteBuffer != null) {
-                        if (Platform.isLinux()) {
+                        if (Platform.isLinux() && false) {
                             hintUnload();
                         }
                         Utils.unmap(this.mappedByteBuffer);
@@ -475,7 +475,7 @@ public abstract class AbstractFile extends ReferenceResource {
             return;
         }
         // Lock memory
-        if (Platform.isLinux()) {
+        if (Platform.isLinux() && false) {
             hintLoad();
         }
     }
@@ -485,11 +485,9 @@ public abstract class AbstractFile extends ReferenceResource {
 
         if (pointer != null) {
             long beginTime = Utils.monotonicMs();
-            if (Platform.isLinux()) {
-                int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_WILLNEED);
-                LOG.info("madvise(MADV_WILLNEED) {} {} {} ret = {} time consuming = {}", pointer, this.filePath,
-                        this.fileSize, ret, Utils.monotonicMs() - beginTime);
-            }
+            int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_WILLNEED);
+            LOG.info("madvise(MADV_WILLNEED) {} {} {} ret = {} time consuming = {}", pointer, this.filePath,
+                    this.fileSize, ret, Utils.monotonicMs() - beginTime);
         }
     }
 
@@ -498,11 +496,9 @@ public abstract class AbstractFile extends ReferenceResource {
 
         if (pointer != null) {
             long beginTime = Utils.monotonicMs();
-            if (Platform.isLinux()) {
-                int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_DONTNEED);
-                LOG.info("madvise(MADV_DONTNEED) {} {} {} ret = {} time consuming = {}", pointer, this.filePath,
-                        this.fileSize, ret, Utils.monotonicMs() - beginTime);
-            }
+            int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_DONTNEED);
+            LOG.info("madvise(MADV_DONTNEED) {} {} {} ret = {} time consuming = {}", pointer, this.filePath,
+                    this.fileSize, ret, Utils.monotonicMs() - beginTime);
         }
     }
 
