@@ -18,6 +18,9 @@ package com.alipay.sofa.jraft.storage.file;
 
 import java.io.File;
 import java.io.RandomAccessFile;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -38,8 +41,6 @@ import com.alipay.sofa.jraft.util.Utils;
 import com.alipay.sofa.jraft.util.concurrent.ReferenceResource;
 import com.sun.jna.NativeLong;
 import com.sun.jna.Pointer;
-
-import sun.nio.ch.DirectBuffer;
 
 /**
  * File parent class that wrappers uniform functions such as mmap(), flush() etc..
@@ -74,6 +75,36 @@ public abstract class AbstractFile extends ReferenceResource {
     protected final Lock          writeLock       = this.readWriteLock.writeLock();
     private volatile boolean      isMapped        = false;
     private final ReentrantLock   mapLock         = new ReentrantLock();
+
+    // Cached method for sun.nio.ch.DirectBuffer#address
+    private static MethodHandle ADDRESS_METHOD = null;
+
+    static {
+        try {
+            Class<?> clazz = Class.forName("sun.nio.ch.DirectBuffer");
+            if (clazz != null) {
+                Method method = clazz.getMethod("address");
+                if (method != null) {
+                    ADDRESS_METHOD = MethodHandles.lookup().unreflect(method);
+                }
+            }
+        } catch (Throwable t) {
+            // NOPMD
+        }
+    }
+
+    private Pointer getPointer() {
+        if (ADDRESS_METHOD != null) {
+            try {
+                final long address = (long) ADDRESS_METHOD.invoke(this.mappedByteBuffer);
+                Pointer pointer = new Pointer(address);
+                return pointer;
+            } catch (Throwable t) {
+                // NOPMD
+            }
+        }
+        return null;
+    }
 
     public AbstractFile(final String filePath, final int fileSize, final boolean isMapped) {
         initAndMap(filePath, fileSize, isMapped);
@@ -450,26 +481,28 @@ public abstract class AbstractFile extends ReferenceResource {
     }
 
     public void hintLoad() {
-        final long address = ((DirectBuffer) (this.mappedByteBuffer)).address();
-        Pointer pointer = new Pointer(address);
+        Pointer pointer = getPointer();
 
-        long beginTime = Utils.monotonicMs();
-        if (Platform.isLinux()) {
-            int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_WILLNEED);
-            LOG.info("madvise(MADV_WILLNEED) {} {} {} ret = {} time consuming = {}", address, this.filePath,
-                this.fileSize, ret, Utils.monotonicMs() - beginTime);
+        if (pointer != null) {
+            long beginTime = Utils.monotonicMs();
+            if (Platform.isLinux()) {
+                int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_WILLNEED);
+                LOG.info("madvise(MADV_WILLNEED) {} {} {} ret = {} time consuming = {}", pointer, this.filePath,
+                        this.fileSize, ret, Utils.monotonicMs() - beginTime);
+            }
         }
     }
 
     public void hintUnload() {
-        final long address = ((DirectBuffer) (this.mappedByteBuffer)).address();
-        Pointer pointer = new Pointer(address);
+        Pointer pointer = getPointer();
 
-        long beginTime = Utils.monotonicMs();
-        if (Platform.isLinux()) {
-            int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_DONTNEED);
-            LOG.info("madvise(MADV_DONTNEED) {} {} {} ret = {} time consuming = {}", address, this.filePath,
-                this.fileSize, ret, Utils.monotonicMs() - beginTime);
+        if (pointer != null) {
+            long beginTime = Utils.monotonicMs();
+            if (Platform.isLinux()) {
+                int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_DONTNEED);
+                LOG.info("madvise(MADV_DONTNEED) {} {} {} ret = {} time consuming = {}", pointer, this.filePath,
+                        this.fileSize, ret, Utils.monotonicMs() - beginTime);
+            }
         }
     }
 
