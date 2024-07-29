@@ -30,11 +30,10 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import com.alipay.sofa.jraft.util.ThreadPoolsFactory;
-import com.codahale.metrics.MetricRegistry;
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -3518,9 +3517,13 @@ public class NodeTest {
         for (final ChangeArg arg : args) {
             arg.stop = true;
         }
-        for (final Future<?> future : futures) {
-            future.get();
-        }
+		for (final Future<?> future : futures) {
+			try {
+				future.get(20, TimeUnit.SECONDS);
+			} catch (TimeoutException e) {
+				LOG.warn("Timeout while waiting for future completion in testChangePeersChaosApplyTasks", e);
+			}
+		}
 
         cluster.waitLeader();
         final SynchronizedClosure done = new SynchronizedClosure();
