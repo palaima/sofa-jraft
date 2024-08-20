@@ -443,8 +443,9 @@ public final class Utils {
      * See https://stackoverflow.com/questions/2972986/how-to-unmap-a-file-from-memory-mapped-using-filechannel-in-java
      */
     public static void unmap(final MappedByteBuffer cb) {
+        UnsafeHelper.unmap(cb);
         // JavaSpecVer: 1.6, 1.7, 1.8, 9, 10
-        final boolean isOldJDK = System.getProperty("java.specification.version", "99").startsWith("1.");
+       /* final boolean isOldJDK = System.getProperty("java.specification.version", "99").startsWith("1.");
         try {
             if (isOldJDK) {
                 final Method cleaner = cb.getClass().getMethod("cleaner");
@@ -470,7 +471,7 @@ public final class Utils {
             }
         } catch (final Exception ex) {
             LOG.error("Fail to un-mapped segment file.", ex);
-        }
+        }*/
     }
 
     public static String getString(final byte[] bs, final int off, final int len) {
