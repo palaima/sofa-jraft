@@ -444,34 +444,6 @@ public final class Utils {
      */
     public static void unmap(final MappedByteBuffer cb) {
         UnsafeHelper.unmap(cb);
-        // JavaSpecVer: 1.6, 1.7, 1.8, 9, 10
-       /* final boolean isOldJDK = System.getProperty("java.specification.version", "99").startsWith("1.");
-        try {
-            if (isOldJDK) {
-                final Method cleaner = cb.getClass().getMethod("cleaner");
-                cleaner.setAccessible(true);
-                final Method clean = Class.forName("sun.misc.Cleaner").getMethod("clean");
-                clean.setAccessible(true);
-                clean.invoke(cleaner.invoke(cb));
-            } else {
-                Class unsafeClass;
-                try {
-                    unsafeClass = Class.forName("sun.misc.Unsafe");
-                } catch (final Exception ex) {
-                    // jdk.internal.misc.Unsafe doesn't yet have an invokeCleaner() method,
-                    // but that method should be added if sun.misc.Unsafe is removed.
-                    unsafeClass = Class.forName("jdk.internal.misc.Unsafe");
-                }
-                final Method clean = unsafeClass.getMethod("invokeCleaner", ByteBuffer.class);
-                clean.setAccessible(true);
-                final Field theUnsafeField = unsafeClass.getDeclaredField("theUnsafe");
-                theUnsafeField.setAccessible(true);
-                final Object theUnsafe = theUnsafeField.get(null);
-                clean.invoke(theUnsafe, cb);
-            }
-        } catch (final Exception ex) {
-            LOG.error("Fail to un-mapped segment file.", ex);
-        }*/
     }
 
     public static String getString(final byte[] bs, final int off, final int len) {
