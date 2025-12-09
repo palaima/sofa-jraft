@@ -30,7 +30,7 @@ import java.nio.MappedByteBuffer;
  */
 public final class UnsafeHelper {
 
-    private static final Logger         LOG             = LoggerFactory.getLogger(UnsafeHelper.class);
+    private static final Logger          LOG             = LoggerFactory.getLogger(UnsafeHelper.class);
 
     private static final IUnsafeAccessor UNSAFE_ACCESSOR = getUnsafeAccessor0();
 
