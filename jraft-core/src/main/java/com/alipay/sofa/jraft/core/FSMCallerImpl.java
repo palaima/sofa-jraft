@@ -30,6 +30,7 @@ import com.alipay.sofa.jraft.FSMCaller;
 import com.alipay.sofa.jraft.StateMachine;
 import com.alipay.sofa.jraft.Status;
 import com.alipay.sofa.jraft.closure.ClosureQueue;
+import com.alipay.sofa.jraft.closure.InternalClosure;
 import com.alipay.sofa.jraft.closure.LoadSnapshotClosure;
 import com.alipay.sofa.jraft.closure.SaveSnapshotClosure;
 import com.alipay.sofa.jraft.closure.TaskClosure;
@@ -333,7 +334,7 @@ public class FSMCallerImpl implements FSMCaller {
      *
      * 2018-Apr-04 2:20:31 PM
      */
-    public class OnErrorClosure implements Closure {
+    public static class OnErrorClosure implements InternalClosure {
         private RaftException error;
 
         public OnErrorClosure(final RaftException error) {
@@ -558,7 +559,19 @@ public class FSMCallerImpl implements FSMCaller {
                 }
 
                 // Apply data task to user state machine
-                doApplyTasks(iterImpl);
+                try {
+                    doApplyTasks(iterImpl);
+                } catch (final Throwable t) {
+                    // If the user state machine throws, we must not let the
+                    // exception propagate — that would skip setLastApplied()
+                    // and stall the apply pipeline permanently (the same
+                    // entries would be retried on every doCommitted() call,
+                    // hitting the same exception in an infinite loop).
+                    LOG.error("StateMachine threw when applying entries starting at index={}. "
+                              + "Halting state machine to avoid stall.", iterImpl.getIndex(), t);
+                    iterImpl.setError(new Status(RaftError.ESTATEMACHINE, "StateMachine threw: %s", t.getMessage()));
+                    break;
+                }
             }
 
             if (iterImpl.hasError()) {

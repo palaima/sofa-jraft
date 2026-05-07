@@ -34,7 +34,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.stream.Collectors;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,6 +50,7 @@ import com.alipay.sofa.jraft.Status;
 import com.alipay.sofa.jraft.closure.CatchUpClosure;
 import com.alipay.sofa.jraft.closure.ClosureQueue;
 import com.alipay.sofa.jraft.closure.ClosureQueueImpl;
+import com.alipay.sofa.jraft.closure.InternalClosure;
 import com.alipay.sofa.jraft.closure.ReadIndexClosure;
 import com.alipay.sofa.jraft.closure.SynchronizedClosure;
 import com.alipay.sofa.jraft.conf.Configuration;
@@ -1193,6 +1194,18 @@ public class NodeImpl implements Node, RaftServerService {
                 LOG.warn("Node {} raise term {} when getLastLogId.", getNodeId(), this.currTerm);
                 return;
             }
+            // Raft requires (term, votedFor) to be persisted BEFORE sending
+            // RequestVote RPCs. If we crash after sending but before persisting,
+            // on restart we won't remember the vote and may vote for a different
+            // candidate in the same term — violating the single-vote-per-term
+            // guarantee. See Section 5.2 of the Raft paper.
+            if (!this.metaStorage.setTermAndVotedFor(this.currTerm, this.serverId)) {
+                LOG.error("Node {} failed to persist term={} and votedFor={}, stepping down.", getNodeId(),
+                    this.currTerm, this.serverId);
+                stepDown(this.currTerm, false, new Status(RaftError.EIO,
+                    "Fail to persist term and votedFor when electSelf"));
+                return;
+            }
             for (final PeerId peer : this.conf.listPeers()) {
                 if (peer.equals(this.serverId)) {
                     continue;
@@ -1214,7 +1227,6 @@ public class NodeImpl implements Node, RaftServerService {
                 this.rpcService.requestVote(peer.getEndpoint(), done.request, done);
             }
 
-            this.metaStorage.setTermAndVotedFor(this.currTerm, this.serverId);
             this.voteCtx.grant(this.serverId);
             if (this.voteCtx.isGranted()) {
                 becomeLeader();
@@ -1328,7 +1340,9 @@ public class NodeImpl implements Node, RaftServerService {
         if (term > this.currTerm) {
             this.currTerm = term;
             this.votedId = PeerId.emptyPeer();
-            this.metaStorage.setTermAndVotedFor(term, this.votedId);
+            if (!this.metaStorage.setTermAndVotedFor(term, this.votedId)) {
+                LOG.error("Node {} failed to persist term and votedFor when stepping down, term={}.", getNodeId(), term);
+            }
         }
 
         if (wakeupCandidate) {
@@ -1500,19 +1514,19 @@ public class NodeImpl implements Node, RaftServerService {
         final ReadIndexResponse.Builder             respBuilder;
         final RpcResponseClosure<ReadIndexResponse> closure;
         final int                                   quorum;
-        final int                                   failPeersThreshold;
+        final int                                   expectedFollowerResponses;
         int                                         ackSuccess;
         int                                         ackFailures;
         boolean                                     isDone;
 
         public ReadIndexHeartbeatResponseClosure(final RpcResponseClosure<ReadIndexResponse> closure,
                                                  final ReadIndexResponse.Builder rb, final int quorum,
-                                                 final int peersCount) {
+                                                 final int expectedFollowerResponses) {
             super();
             this.closure = closure;
             this.respBuilder = rb;
             this.quorum = quorum;
-            this.failPeersThreshold = peersCount % 2 == 0 ? (quorum - 1) : quorum;
+            this.expectedFollowerResponses = expectedFollowerResponses;
             this.ackSuccess = 0;
             this.ackFailures = 0;
             this.isDone = false;
@@ -1534,7 +1548,8 @@ public class NodeImpl implements Node, RaftServerService {
                 this.closure.setResponse(this.respBuilder.build());
                 this.closure.run(Status.OK());
                 this.isDone = true;
-            } else if (this.ackFailures >= this.failPeersThreshold) {
+                // The extra 1 is the leader's own vote, so only follower failures are counted here.
+            } else if (this.ackFailures > this.expectedFollowerResponses + 1 - this.quorum) {
                 this.respBuilder.setSuccess(false);
                 this.closure.setResponse(this.respBuilder.build());
                 this.closure.run(Status.OK());
@@ -1639,10 +1654,17 @@ public class NodeImpl implements Node, RaftServerService {
             case ReadOnlySafe:
                 final List<PeerId> peers = this.conf.getConf().getPeers();
                 Requires.requireTrue(peers != null && !peers.isEmpty(), "Empty peers");
+                final List<PeerId> targetPeers = filterPeersForReadIndex(peers);
+                int expectedResponses = 0;
+                for (final PeerId peer : targetPeers) {
+                    if (!peer.equals(this.serverId)) {
+                        expectedResponses++;
+                    }
+                }
                 final ReadIndexHeartbeatResponseClosure heartbeatDone = new ReadIndexHeartbeatResponseClosure(closure,
-                    respBuilder, quorum, peers.size());
+                    respBuilder, quorum, expectedResponses);
                 // Send heartbeat requests to followers
-                for (final PeerId peer : peers) {
+                for (final PeerId peer : targetPeers) {
                     if (peer.equals(this.serverId)) {
                         continue;
                     }
@@ -1656,6 +1678,58 @@ public class NodeImpl implements Node, RaftServerService {
                 closure.run(Status.OK());
                 break;
         }
+    }
+
+    /**
+     * Filter peers for ReadIndex based on replication lag.
+     * Skip followers that are too far behind.
+     */
+    private List<PeerId> filterPeersForReadIndex(final List<PeerId> allPeers) {
+        final int maxLag = this.raftOptions.getMaxReadIndexLag();
+        if (maxLag < 0) {
+            return allPeers;
+        }
+
+        final long lastLogIndex = this.logManager.getLastLogIndex();
+        final int quorum = getQuorum();
+        final List<PeerId> healthyPeers = new ArrayList<>(allPeers.size());
+
+        for (final PeerId peer : allPeers) {
+            if (peer.equals(this.serverId)) {
+                continue;
+            }
+            final ThreadId rid = this.replicatorGroup.getReplicator(peer);
+            if (rid == null) {
+                continue;
+            }
+
+            final long nextIndex = Replicator.getNextIndexUnsafe(rid);
+            if (nextIndex <= 0) {
+                continue;
+            }
+
+            final long logLag = lastLogIndex - (nextIndex - 1);
+
+            if (logLag <= maxLag) {
+                healthyPeers.add(peer);
+            } else {
+                LOG.debug("Skip peer {} for ReadIndex, log lag {} exceeds threshold {}", peer, logLag, maxLag);
+            }
+        }
+
+        // Ensure enough peers to reach quorum
+        if (healthyPeers.size() + 1 < quorum) {
+            LOG.debug("Not enough healthy peers ({}) for quorum ({}), fallback to all peers", healthyPeers.size(),
+                quorum);
+            return allPeers;
+        }
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Filtered {} healthy peers out of {} for ReadIndex (maxReadIndexLag={})", healthyPeers.size(),
+                allPeers.size() - 1, maxLag);
+        }
+
+        return healthyPeers;
     }
 
     @Override
@@ -1855,8 +1929,13 @@ public class NodeImpl implements Node, RaftServerService {
                 if (logIsOk && (this.votedId == null || this.votedId.isEmpty())) {
                     stepDown(request.getTerm(), false, new Status(RaftError.EVOTEFORCANDIDATE,
                         "Raft node votes for some candidate, step down to restart election_timer."));
-                    this.votedId = candidateId.copy();
-                    this.metaStorage.setVotedFor(candidateId);
+                    if (this.metaStorage.setVotedFor(candidateId)) {
+                        this.votedId = candidateId.copy();
+                    } else {
+                        LOG.error("Node {} failed to persist votedFor when voting for {}, term={}.", getNodeId(),
+                            candidateId, this.currTerm);
+                        break;
+                    }
                 }
             } while (false);
 
@@ -2366,7 +2445,7 @@ public class NodeImpl implements Node, RaftServerService {
      *
      * 2018-Apr-11 2:53:43 PM
      */
-    private class ConfigurationChangeDone implements Closure {
+    private class ConfigurationChangeDone implements InternalClosure {
         private final long    term;
         private final boolean leaderStart;
 
