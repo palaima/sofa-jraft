@@ -482,10 +482,13 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
             }
             sb.append("onSnapshotLoadDone, ").append(this.loadingSnapshotMeta);
             LOG.info(sb.toString());
+            final long loadedSnapshotIndex = this.loadingSnapshotMeta.getLastIncludedIndex();
             doUnlock = false;
             this.lock.unlock();
             if (this.node != null) {
-                this.node.updateConfigurationAfterInstallingSnapshot();
+                // Pass a rollback index only when the load succeeded: on failure the
+                // snapshot was not applied, so the ballot box must not move.
+                this.node.updateConfigurationAfterInstallingSnapshot(st.isOk() ? loadedSnapshotIndex : -1);
             }
             doUnlock = true;
             this.lock.lock();
@@ -612,12 +615,40 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
                 return false;
             }
             if (ds.request.getMeta().getLastIncludedIndex() <= this.lastSnapshotIndex) {
+                if (ds.request.getMeta().getLastIncludedIndex() == this.lastSnapshotIndex
+                    && ds.request.getMeta().getLastIncludedTerm() == this.lastSnapshotTerm) {
+                    // Exact retry of the snapshot already installed.
+                    LOG.warn("Register DownloadingSnapshot failed: snapshot is not newer, "
+                             + "request lastIncludedIndex={}, lastSnapshotIndex={}.", ds.request.getMeta()
+                        .getLastIncludedIndex(), this.lastSnapshotIndex);
+                    ds.responseBuilder.setSuccess(true);
+                    ds.done.sendResponse(ds.responseBuilder.build());
+                    return false;
+                }
+                if (ds.request.getMeta().getLastIncludedIndex() == this.lastSnapshotIndex) {
+                    // Same index but a different term: snapshot storage keys snapshots
+                    // by index only, so an in-place replace is not supported — close()
+                    // short-circuits with EEXISTS, silently keeping the local branch's
+                    // data while the executor would book the leader's meta and reply
+                    // success. Reject loudly instead; the leader blocks and retries,
+                    // converging once it produces a snapshot at a strictly higher index.
+                    LOG.error("Register DownloadingSnapshot failed: conflicting snapshot at the same index, "
+                              + "request lastIncludedIndex={} lastIncludedTerm={}, "
+                              + "local lastSnapshotIndex={} lastSnapshotTerm={}.", ds.request.getMeta()
+                        .getLastIncludedIndex(), ds.request.getMeta().getLastIncludedTerm(), this.lastSnapshotIndex,
+                        this.lastSnapshotTerm);
+                    ds.responseBuilder.setSuccess(false);
+                    ds.done.sendResponse(ds.responseBuilder.build());
+                    return false;
+                }
+                // A lower index with a different snapshot id may come from
+                // another branch. Install it instead of returning a false success.
                 LOG.warn(
-                    "Register DownloadingSnapshot failed: snapshot is not newer, request lastIncludedIndex={}, lastSnapshotIndex={}.",
-                    ds.request.getMeta().getLastIncludedIndex(), this.lastSnapshotIndex);
-                ds.responseBuilder.setSuccess(true);
-                ds.done.sendResponse(ds.responseBuilder.build());
-                return false;
+                    "Local snapshot conflicts with the installing one, proceeding with installation (branch switch): "
+                            + "request lastIncludedIndex={} lastIncludedTerm={}, "
+                            + "local lastSnapshotIndex={} lastSnapshotTerm={}.", ds.request.getMeta()
+                        .getLastIncludedIndex(), ds.request.getMeta().getLastIncludedTerm(), this.lastSnapshotIndex,
+                    this.lastSnapshotTerm);
             }
             final DownloadingSnapshot m = this.downloadingSnapshot.get();
             if (m == null) {
@@ -641,10 +672,10 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
             // snapshot and resume it, otherwise drop previous snapshot as this one is
             // newer
 
-            if (m.request.getMeta().getLastIncludedIndex() == ds.request.getMeta().getLastIncludedIndex()) {
-                // m is a retry
-                // Copy |*ds| to |*m| so that the former session would respond
-                // this RPC.
+            if (m.request.getMeta().getLastIncludedIndex() == ds.request.getMeta().getLastIncludedIndex()
+                && m.request.getMeta().getLastIncludedTerm() == ds.request.getMeta().getLastIncludedTerm()) {
+                // m is a retry. Copy |*ds| to |*m| so the former session responds
+                // to this RPC.
                 saved = m;
                 this.downloadingSnapshot.set(ds);
                 result = true;

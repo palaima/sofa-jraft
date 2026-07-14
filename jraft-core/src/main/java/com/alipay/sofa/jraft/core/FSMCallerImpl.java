@@ -713,12 +713,12 @@ public class FSMCallerImpl implements FSMCaller {
         }
         final LogId lastAppliedId = new LogId(this.lastAppliedIndex.get(), this.lastAppliedTerm);
         final LogId snapshotId = new LogId(meta.getLastIncludedIndex(), meta.getLastIncludedTerm());
-        if (lastAppliedId.compareTo(snapshotId) > 0) {
-            done.run(new Status(
-                RaftError.ESTALE,
-                "Loading a stale snapshot last_applied_index=%d last_applied_term=%d snapshot_index=%d snapshot_term=%d",
-                lastAppliedId.getIndex(), lastAppliedId.getTerm(), snapshotId.getIndex(), snapshotId.getTerm()));
-            return;
+        // The install path already verified the current-term leader. A follower may
+        // have applied a divergent branch, so (index, term) ordering alone cannot
+        // reject the snapshot; compare indexes to keep rollbacks visible.
+        if (lastAppliedId.compareTo(snapshotId) >= 0 || lastAppliedId.getIndex() >= snapshotId.getIndex()) {
+            LOG.warn("Loading snapshot not newer than applied state (branch switch / rollback): "
+                     + "last_applied_id={}, snapshot_id={}.", lastAppliedId, snapshotId);
         }
         if (!this.fsm.onSnapshotLoad(reader)) {
             done.run(new Status(-1, "StateMachine onSnapshotLoad failed"));

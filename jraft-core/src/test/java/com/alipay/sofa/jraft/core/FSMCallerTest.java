@@ -17,6 +17,7 @@
 package com.alipay.sofa.jraft.core;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.After;
 import org.junit.Before;
@@ -28,8 +29,10 @@ import org.mockito.Mockito;
 import org.mockito.runners.MockitoJUnitRunner;
 
 import com.alipay.sofa.jraft.Iterator;
+import com.alipay.sofa.jraft.JRaftUtils;
 import com.alipay.sofa.jraft.StateMachine;
 import com.alipay.sofa.jraft.Status;
+import com.alipay.sofa.jraft.conf.Configuration;
 import com.alipay.sofa.jraft.closure.ClosureQueueImpl;
 import com.alipay.sofa.jraft.closure.LoadSnapshotClosure;
 import com.alipay.sofa.jraft.closure.SaveSnapshotClosure;
@@ -39,7 +42,6 @@ import com.alipay.sofa.jraft.entity.LeaderChangeContext;
 import com.alipay.sofa.jraft.entity.LogEntry;
 import com.alipay.sofa.jraft.entity.LogId;
 import com.alipay.sofa.jraft.entity.RaftOutter.SnapshotMeta;
-import com.alipay.sofa.jraft.error.RaftError;
 import com.alipay.sofa.jraft.error.RaftException;
 import com.alipay.sofa.jraft.option.FSMCallerOptions;
 import com.alipay.sofa.jraft.storage.LogManager;
@@ -297,20 +299,27 @@ public class FSMCallerTest {
         Mockito.verify(this.fsm).onError(Mockito.any());
     }
 
-    @Test
-    public void testOnSnapshotLoadStale() throws Exception {
-        final SnapshotReader reader = Mockito.mock(SnapshotReader.class);
+    private void restartCallerWithBootstrapId(final LogId bootstrapId) throws Exception {
+        this.fsmCaller.shutdown();
+        this.fsmCaller.join();
+        this.fsmCaller = new FSMCallerImpl();
+        final FSMCallerOptions opts = new FSMCallerOptions();
+        opts.setNode(this.node);
+        opts.setFsm(this.fsm);
+        opts.setLogManager(this.logManager);
+        opts.setBootstrapId(bootstrapId);
+        opts.setClosureQueue(this.closureQueue);
+        assertTrue(this.fsmCaller.init(opts));
+    }
 
-        final SnapshotMeta meta = SnapshotMeta.newBuilder().setLastIncludedIndex(5).setLastIncludedTerm(1).build();
-        Mockito.when(reader.load()).thenReturn(meta);
-
+    private Status loadSnapshotAndAwait(final SnapshotReader reader) throws Exception {
+        final AtomicReference<Status> loadStatus = new AtomicReference<>();
         final CountDownLatch latch = new CountDownLatch(1);
         this.fsmCaller.onSnapshotLoad(new LoadSnapshotClosure() {
 
             @Override
             public void run(final Status status) {
-                assertFalse(status.isOk());
-                assertEquals(RaftError.ESTALE, status.getRaftError());
+                loadStatus.set(status);
                 latch.countDown();
             }
 
@@ -320,8 +329,77 @@ public class FSMCallerTest {
             }
         });
         latch.await();
-        assertEquals(this.fsmCaller.getLastCommittedIndex(), 10);
-        assertEquals(this.fsmCaller.getLastAppliedIndex(), 10);
+        return loadStatus.get();
+    }
+
+    @Test
+    public void testOnSnapshotLoadHigherIndexLowerTerm() throws Exception {
+        // Index wins over local term ordering when loading a leader snapshot.
+        restartCallerWithBootstrapId(new LogId(24, 1466));
+
+        final SnapshotReader reader = Mockito.mock(SnapshotReader.class);
+        final SnapshotMeta meta = SnapshotMeta.newBuilder().setLastIncludedIndex(30).setLastIncludedTerm(9).build();
+        Mockito.when(reader.load()).thenReturn(meta);
+        Mockito.when(this.fsm.onSnapshotLoad(reader)).thenReturn(true);
+
+        final Status st = loadSnapshotAndAwait(reader);
+        assertTrue(st.isOk());
+        assertEquals(30, this.fsmCaller.getLastAppliedIndex());
+        assertEquals(30, this.fsmCaller.getLastCommittedIndex());
+    }
+
+    @Test
+    public void testOnSnapshotLoadLowerIndexHigherTerm() throws Exception {
+        // A leader snapshot may roll back applied index when changing branches.
+        restartCallerWithBootstrapId(new LogId(24, 11));
+
+        final SnapshotReader reader = Mockito.mock(SnapshotReader.class);
+        final SnapshotMeta meta = SnapshotMeta.newBuilder().setLastIncludedIndex(20).setLastIncludedTerm(14) //
+            .addPeers("localhost:8081").addPeers("localhost:8082").build();
+        Mockito.when(reader.load()).thenReturn(meta);
+        Mockito.when(this.fsm.onSnapshotLoad(reader)).thenReturn(true);
+
+        final Status st = loadSnapshotAndAwait(reader);
+        assertTrue(st.isOk());
+        assertEquals(20, this.fsmCaller.getLastAppliedIndex());
+        assertEquals(20, this.fsmCaller.getLastCommittedIndex());
+        // Commit the leader snapshot configuration.
+        final Configuration expectedConf = JRaftUtils.getConfiguration("localhost:8081,localhost:8082");
+        Mockito.verify(this.fsm).onConfigurationCommitted(expectedConf);
+    }
+
+    @Test
+    public void testOnSnapshotLoadLowerIndexSameTerm() throws Exception {
+        // Same term does not prove the snapshot is on the local branch.
+        final SnapshotReader reader = Mockito.mock(SnapshotReader.class);
+        final SnapshotMeta meta = SnapshotMeta.newBuilder().setLastIncludedIndex(5).setLastIncludedTerm(1).build();
+        Mockito.when(reader.load()).thenReturn(meta);
+        Mockito.when(this.fsm.onSnapshotLoad(reader)).thenReturn(true);
+
+        final Status st = loadSnapshotAndAwait(reader);
+        assertTrue(st.isOk());
+        assertEquals(5, this.fsmCaller.getLastAppliedIndex());
+        assertEquals(5, this.fsmCaller.getLastCommittedIndex());
+    }
+
+    @Test
+    public void testOnSnapshotLoadLowerIndexSameTermCommitsConf() throws Exception {
+        // Same term with a lower index still loads and commits the leader config.
+        restartCallerWithBootstrapId(new LogId(254, 76));
+
+        final SnapshotReader reader = Mockito.mock(SnapshotReader.class);
+        final SnapshotMeta meta = SnapshotMeta.newBuilder().setLastIncludedIndex(14).setLastIncludedTerm(76) //
+            .addPeers("localhost:8081").addPeers("localhost:8082").addPeers("localhost:8083").build();
+        Mockito.when(reader.load()).thenReturn(meta);
+        Mockito.when(this.fsm.onSnapshotLoad(reader)).thenReturn(true);
+
+        final Status st = loadSnapshotAndAwait(reader);
+        assertTrue(st.isOk());
+        assertEquals(14, this.fsmCaller.getLastAppliedIndex());
+        assertEquals(14, this.fsmCaller.getLastCommittedIndex());
+        // Replace any local branch configuration with the leader's.
+        final Configuration expectedConf = JRaftUtils.getConfiguration("localhost:8081,localhost:8082,localhost:8083");
+        Mockito.verify(this.fsm).onConfigurationCommitted(expectedConf);
     }
 
 }

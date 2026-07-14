@@ -631,8 +631,20 @@ public class LogManagerImpl implements LogManager {
         boolean doUnlock = true;
         this.writeLock.lock();
         try {
+            boolean branchSwitch = false;
             if (meta.getLastIncludedIndex() <= this.lastSnapshotId.getIndex()) {
-                return;
+                if (meta.getLastIncludedIndex() == this.lastSnapshotId.getIndex()
+                    && meta.getLastIncludedTerm() == this.lastSnapshotId.getTerm()) {
+                    // Exact duplicate of the current snapshot, nothing to do.
+                    return;
+                }
+                // Same-or-lower index with a different snapshot id may come from
+                // another branch. Accept the leader snapshot and collapse the log.
+                LOG.warn(
+                    "Local snapshot conflicts with the incoming one, switching branch: incoming lastIncludedIndex={} "
+                            + "lastIncludedTerm={}, local lastSnapshotId={}.", meta.getLastIncludedIndex(),
+                    meta.getLastIncludedTerm(), this.lastSnapshotId);
+                branchSwitch = true;
             }
             final Configuration conf = confFromMeta(meta);
             final Configuration oldConf = oldConfFromMeta(meta);
@@ -646,7 +658,7 @@ public class LogManagerImpl implements LogManager {
             this.lastSnapshotId.setIndex(meta.getLastIncludedIndex());
             this.lastSnapshotId.setTerm(meta.getLastIncludedTerm());
 
-            if (this.lastSnapshotId.compareTo(this.appliedId) > 0) {
+            if (branchSwitch || this.lastSnapshotId.compareTo(this.appliedId) > 0) {
                 this.appliedId = this.lastSnapshotId.copy();
             }
             // NOTICE: not to update disk_id here as we are not sure if this node really
@@ -658,7 +670,12 @@ public class LogManagerImpl implements LogManager {
             //                this.diskId = this.lastSnapshotId.copy();
             //            }
 
-            if (term == 0) {
+            if (branchSwitch) {
+                // Drop local log state from the abandoned branch.
+                if (!reset(meta.getLastIncludedIndex() + 1)) {
+                    LOG.warn("Reset log manager failed, nextLogIndex={}.", meta.getLastIncludedIndex() + 1);
+                }
+            } else if (term == 0) {
                 // last_included_index is larger than last_index
                 // FIXME: what if last_included_index is less than first_index?
                 doUnlock = false;

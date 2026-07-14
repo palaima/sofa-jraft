@@ -19,7 +19,9 @@ package com.alipay.sofa.jraft.storage;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.After;
 import org.junit.Before;
@@ -67,6 +69,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Matchers.eq;
@@ -305,6 +308,219 @@ public class SnapshotExecutorTest extends BaseStorageTest {
         this.executor.join();
         assertEquals(2, this.executor.getLastSnapshotTerm());
         assertEquals(1, this.executor.getLastSnapshotIndex());
+    }
+
+    private void seedLocalSnapshot(final long index, final long term) throws Exception {
+        final LocalSnapshotStorage seedStorage = new LocalSnapshotStorage(this.path, null, this.raftOptions);
+        assertTrue(seedStorage.init(null));
+        seedStorage.setServerAddr(new Endpoint("localhost", 8081));
+        final LocalSnapshotWriter seedWriter = (LocalSnapshotWriter) seedStorage.create();
+        assertNotNull(seedWriter);
+        assertTrue(seedWriter.saveMeta(RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(index)
+            .setLastIncludedTerm(term).build()));
+        seedWriter.close();
+        seedStorage.shutdown();
+    }
+
+    private void restartSeededExecutor() throws Exception {
+        this.executor.shutdown();
+        this.executor.join();
+        Mockito.when(this.fSMCaller.onSnapshotLoad(Mockito.any(LoadSnapshotClosure.class))).thenAnswer(
+            new Answer<Boolean>() {
+
+                @Override
+                public Boolean answer(final InvocationOnMock invocation) throws Throwable {
+                    final LoadSnapshotClosure done = (LoadSnapshotClosure) invocation.getArguments()[0];
+                    done.run(Status.OK());
+                    return true;
+                }
+            });
+        this.executor = new SnapshotExecutorImpl();
+        final SnapshotExecutorOptions opts = new SnapshotExecutorOptions();
+        opts.setFsmCaller(this.fSMCaller);
+        opts.setInitTerm(0);
+        opts.setNode(this.node);
+        opts.setLogManager(this.logManager);
+        opts.setAddr(this.addr);
+        assertTrue(this.executor.init(opts));
+    }
+
+    private MockAsyncContext installRemoteSnapshot(final long index, final long term) throws Exception {
+        final RpcRequests.InstallSnapshotRequest.Builder irb = RpcRequests.InstallSnapshotRequest.newBuilder();
+        irb.setGroupId("test");
+        irb.setPeerId(this.addr.toString());
+        irb.setServerId("localhost:8080");
+        irb.setUri("remote://localhost:8080/99");
+        irb.setTerm(0);
+        irb.setMeta(RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(index).setLastIncludedTerm(term));
+
+        Mockito.when(this.raftClientService.connect(new Endpoint("localhost", 8080))).thenReturn(true);
+
+        final FutureImpl<Message> future = new FutureImpl<>();
+        final RpcRequests.GetFileRequest.Builder rb = RpcRequests.GetFileRequest.newBuilder().setReaderId(99)
+            .setFilename(Snapshot.JRAFT_SNAPSHOT_META_FILE).setCount(Integer.MAX_VALUE).setOffset(0)
+            .setReadPartly(true);
+        final RpcRequests.GetFileRequest metaFileRequest = rb.build();
+        rb.setFilename("testFile");
+        rb.setCount(this.raftOptions.getMaxByteCountPerRpc());
+        final RpcRequests.GetFileRequest dataFileRequest = rb.build();
+
+        // Register BOTH stubs before the install thread starts: re-stubbing a mock
+        // while another thread may be invoking it is a Mockito race, and the latch
+        // handshake replaces the former sleep-then-getValue() flakes.
+        final AtomicReference<RpcResponseClosure<RpcRequests.GetFileResponse>> metaClosureRef = new AtomicReference<>();
+        final AtomicReference<RpcResponseClosure<RpcRequests.GetFileResponse>> dataClosureRef = new AtomicReference<>();
+        final CountDownLatch metaLatch = new CountDownLatch(1);
+        final CountDownLatch dataLatch = new CountDownLatch(1);
+        Mockito.when(
+            this.raftClientService.getFile(eq(new Endpoint("localhost", 8080)), eq(metaFileRequest),
+                eq(this.copyOpts.getTimeoutMs()), Mockito.any(RpcResponseClosure.class))).thenAnswer(invocation -> {
+            metaClosureRef.set((RpcResponseClosure<RpcRequests.GetFileResponse>) invocation.getArguments()[3]);
+            metaLatch.countDown();
+            return future;
+        });
+        Mockito.when(
+            this.raftClientService.getFile(eq(new Endpoint("localhost", 8080)), eq(dataFileRequest),
+                eq(this.copyOpts.getTimeoutMs()), Mockito.any(RpcResponseClosure.class))).thenAnswer(invocation -> {
+            dataClosureRef.set((RpcResponseClosure<RpcRequests.GetFileResponse>) invocation.getArguments()[3]);
+            dataLatch.countDown();
+            return future;
+        });
+
+        final MockAsyncContext installContext = new MockAsyncContext();
+        TestUtils.runInThread(() -> SnapshotExecutorTest.this.executor.installSnapshot(irb.build(),
+            RpcRequests.InstallSnapshotResponse.newBuilder(), new RpcRequestClosure(installContext)));
+
+        assertTrue("Timed out waiting for the meta file request", metaLatch.await(30, TimeUnit.SECONDS));
+        RpcResponseClosure<RpcRequests.GetFileResponse> closure = metaClosureRef.get();
+        final LocalSnapshotMetaTable installingMetaTable = new LocalSnapshotMetaTable(this.raftOptions);
+        installingMetaTable.addFile("testFile",
+            LocalFileMetaOutter.LocalFileMeta.newBuilder().setChecksum("test").build());
+        installingMetaTable.setMeta(
+            RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(index).setLastIncludedTerm(term).build());
+        final ByteBuffer metaBuf = installingMetaTable.saveToByteBufferAsRemote();
+        closure.setResponse(RpcRequests.GetFileResponse.newBuilder().setReadSize(metaBuf.remaining()).setEof(true)
+            .setData(ByteString.copyFrom(metaBuf)).build());
+        closure.run(Status.OK());
+
+        assertTrue("Timed out waiting for the data file request", dataLatch.await(30, TimeUnit.SECONDS));
+        closure = dataClosureRef.get();
+        closure.setResponse(RpcRequests.GetFileResponse.newBuilder().setReadSize(100).setEof(true)
+            .setData(ByteString.copyFrom(new byte[100])).build());
+        closure.run(Status.OK());
+
+        this.executor.join();
+        return installContext;
+    }
+
+    @Test
+    public void testInstallSnapshotLowerIndexDifferentTerm() throws Exception {
+        // A lower leader snapshot with a different term can replace local branch state.
+        seedLocalSnapshot(24, 11);
+        restartSeededExecutor();
+        assertEquals(24, this.executor.getLastSnapshotIndex());
+        assertEquals(11, this.executor.getLastSnapshotTerm());
+
+        final MockAsyncContext installContext = installRemoteSnapshot(20, 14);
+
+        assertEquals(20, this.executor.getLastSnapshotIndex());
+        assertEquals(14, this.executor.getLastSnapshotTerm());
+        assertNotNull(installContext.getResponseObject());
+        assertTrue(installContext.as(RpcRequests.InstallSnapshotResponse.class).getSuccess());
+        final ArgumentCaptor<RaftOutter.SnapshotMeta> metaArg = ArgumentCaptor.forClass(RaftOutter.SnapshotMeta.class);
+        Mockito.verify(this.logManager, Mockito.times(2)).setSnapshot(metaArg.capture());
+        assertEquals(20, metaArg.getValue().getLastIncludedIndex());
+        assertEquals(14, metaArg.getValue().getLastIncludedTerm());
+        Mockito.verify(this.node).updateConfigurationAfterInstallingSnapshot(20L);
+    }
+
+    @Test
+    public void testInstallSnapshotExactDuplicateIsNoOpSuccess() throws Exception {
+        // Exact duplicate is the only safe no-op for a not-newer snapshot.
+        seedLocalSnapshot(24, 11);
+        restartSeededExecutor();
+        assertEquals(24, this.executor.getLastSnapshotIndex());
+        assertEquals(11, this.executor.getLastSnapshotTerm());
+
+        final RpcRequests.InstallSnapshotRequest.Builder irb = RpcRequests.InstallSnapshotRequest.newBuilder();
+        irb.setGroupId("test");
+        irb.setPeerId(this.addr.toString());
+        irb.setServerId("localhost:8080");
+        irb.setUri("remote://localhost:8080/99");
+        irb.setTerm(0);
+        irb.setMeta(RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(24).setLastIncludedTerm(11));
+
+        final MockAsyncContext installContext = new MockAsyncContext();
+        this.executor.installSnapshot(irb.build(), RpcRequests.InstallSnapshotResponse.newBuilder(),
+            new RpcRequestClosure(installContext));
+
+        assertNotNull(installContext.getResponseObject());
+        assertTrue(installContext.as(RpcRequests.InstallSnapshotResponse.class).getSuccess());
+        assertEquals(24, this.executor.getLastSnapshotIndex());
+        assertEquals(11, this.executor.getLastSnapshotTerm());
+        Mockito.verify(this.raftClientService, Mockito.never()).getFile(Mockito.any(Endpoint.class),
+            Mockito.any(RpcRequests.GetFileRequest.class), Mockito.anyInt(), Mockito.any(RpcResponseClosure.class));
+    }
+
+    @Test
+    public void testInstallSnapshotSameIndexDifferentTermRejected() throws Exception {
+        // A same-index/different-term snapshot cannot be installed safely: storage
+        // keys snapshots by index only, so close() short-circuits with EEXISTS and
+        // silently keeps the old branch's data while the executor would book the
+        // leader's meta and reply success. Reject loudly instead of corrupting state.
+        seedLocalSnapshot(24, 11);
+        restartSeededExecutor();
+        assertEquals(24, this.executor.getLastSnapshotIndex());
+        assertEquals(11, this.executor.getLastSnapshotTerm());
+
+        final RpcRequests.InstallSnapshotRequest.Builder irb = RpcRequests.InstallSnapshotRequest.newBuilder();
+        irb.setGroupId("test");
+        irb.setPeerId(this.addr.toString());
+        irb.setServerId("localhost:8080");
+        irb.setUri("remote://localhost:8080/99");
+        irb.setTerm(0);
+        irb.setMeta(RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(24).setLastIncludedTerm(12));
+
+        final MockAsyncContext installContext = new MockAsyncContext();
+        this.executor.installSnapshot(irb.build(), RpcRequests.InstallSnapshotResponse.newBuilder(),
+            new RpcRequestClosure(installContext));
+
+        assertNotNull(installContext.getResponseObject());
+        assertFalse(installContext.as(RpcRequests.InstallSnapshotResponse.class).getSuccess());
+        assertEquals(24, this.executor.getLastSnapshotIndex());
+        assertEquals(11, this.executor.getLastSnapshotTerm());
+        // No download may even start.
+        Mockito.verify(this.raftClientService, Mockito.never()).getFile(Mockito.any(Endpoint.class),
+            Mockito.any(RpcRequests.GetFileRequest.class), Mockito.anyInt(), Mockito.any(RpcResponseClosure.class));
+        // Only the init-time load of the seeded snapshot — the remote one must never reach the FSM.
+        Mockito.verify(this.fSMCaller, Mockito.times(1)).onSnapshotLoad(Mockito.any(LoadSnapshotClosure.class));
+        // Only the init-time booking of the seeded meta — the leader's meta must not be recorded.
+        final ArgumentCaptor<RaftOutter.SnapshotMeta> metaArg = ArgumentCaptor.forClass(RaftOutter.SnapshotMeta.class);
+        Mockito.verify(this.logManager, Mockito.times(1)).setSnapshot(metaArg.capture());
+        assertEquals(24, metaArg.getValue().getLastIncludedIndex());
+        assertEquals(11, metaArg.getValue().getLastIncludedTerm());
+        Mockito.verify(this.node, Mockito.times(1)).updateConfigurationAfterInstallingSnapshot(Mockito.anyLong());
+    }
+
+    @Test
+    public void testInstallSnapshotLowerIndexSameTerm() throws Exception {
+        // Same term does not prove the local snapshot is on the leader's branch.
+        seedLocalSnapshot(254, 76);
+        restartSeededExecutor();
+        assertEquals(254, this.executor.getLastSnapshotIndex());
+        assertEquals(76, this.executor.getLastSnapshotTerm());
+
+        final MockAsyncContext installContext = installRemoteSnapshot(14, 76);
+
+        assertEquals(14, this.executor.getLastSnapshotIndex());
+        assertEquals(76, this.executor.getLastSnapshotTerm());
+        assertNotNull(installContext.getResponseObject());
+        assertTrue(installContext.as(RpcRequests.InstallSnapshotResponse.class).getSuccess());
+        final ArgumentCaptor<RaftOutter.SnapshotMeta> metaArg = ArgumentCaptor.forClass(RaftOutter.SnapshotMeta.class);
+        Mockito.verify(this.logManager, Mockito.times(2)).setSnapshot(metaArg.capture());
+        assertEquals(14, metaArg.getValue().getLastIncludedIndex());
+        assertEquals(76, metaArg.getValue().getLastIncludedTerm());
+        Mockito.verify(this.node).updateConfigurationAfterInstallingSnapshot(14L);
     }
 
     @Test

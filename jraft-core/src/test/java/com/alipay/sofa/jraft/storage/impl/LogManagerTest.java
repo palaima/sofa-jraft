@@ -386,6 +386,69 @@ public class LogManagerTest extends BaseStorageTest {
     }
 
     @Test
+    public void testSetSnapshotConflictingLowerIndexBranchSwitch() throws Exception {
+        // Entries 1..10 with term(k) = k - 1; own snapshot at (10, term 9).
+        mockAddEntries();
+        RaftOutter.SnapshotMeta meta = RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(10)
+            .setLastIncludedTerm(9).addPeers("localhost:8081").build();
+        this.logManager.setSnapshot(meta);
+        assertEquals(10, this.logManager.getLastLogIndex());
+
+        // Conflicting leader snapshot collapses the local log to its boundary.
+        meta = RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(6).setLastIncludedTerm(14)
+            .addPeers("localhost:8081").addPeers("localhost:8082").build();
+        this.logManager.setSnapshot(meta);
+        Thread.sleep(1000);
+
+        assertEquals(14, this.logManager.getTerm(6));
+        assertEquals(6, this.logManager.getLastLogIndex());
+        assertNull(this.logManager.getEntry(8));
+        assertEquals(0, this.logManager.getTerm(10));
+        assertEquals(JRaftUtils.getConfiguration("localhost:8081,localhost:8082"), this.logManager.getConfiguration(6)
+            .getConf());
+    }
+
+    @Test
+    public void testSetSnapshotLowerIndexSameTermBranchSwitch() throws Exception {
+        // Entries 1..10 with term(k) = k - 1; own snapshot at (10, term 9).
+        mockAddEntries();
+        RaftOutter.SnapshotMeta meta = RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(10)
+            .setLastIncludedTerm(9).addPeers("localhost:8081").build();
+        this.logManager.setSnapshot(meta);
+        assertEquals(10, this.logManager.getLastLogIndex());
+
+        // Same term still switches branch when the leader snapshot is lower.
+        meta = RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(6).setLastIncludedTerm(9)
+            .addPeers("localhost:8081").addPeers("localhost:8082").addPeers("localhost:8083").build();
+        this.logManager.setSnapshot(meta);
+        Thread.sleep(1000);
+
+        assertEquals(9, this.logManager.getTerm(6));
+        assertEquals(6, this.logManager.getLastLogIndex());
+        assertNull(this.logManager.getEntry(8));
+        assertEquals(0, this.logManager.getTerm(10));
+        assertEquals(JRaftUtils.getConfiguration("localhost:8081,localhost:8082,localhost:8083"), this.logManager
+            .getConfiguration(6).getConf());
+    }
+
+    @Test
+    public void testSetSnapshotDuplicateSameBranchIsIgnored() throws Exception {
+        final List<LogEntry> entries = mockAddEntries();
+        final RaftOutter.SnapshotMeta meta = RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(10)
+            .setLastIncludedTerm(9).addPeers("localhost:8081").build();
+        this.logManager.setSnapshot(meta);
+        // A duplicate/retry of the same snapshot (same index and term) stays a no-op.
+        this.logManager.setSnapshot(RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(10)
+            .setLastIncludedTerm(9).addPeers("localhost:8081").build());
+        Thread.sleep(500);
+
+        assertEquals(10, this.logManager.getLastLogIndex());
+        for (int i = 0; i < 10; i++) {
+            Assert.assertEquals(entries.get(i), this.logManager.getEntry(i + 1));
+        }
+    }
+
+    @Test
     public void testWaiter() throws Exception {
         mockAddEntries();
         final Object theArg = new Object();

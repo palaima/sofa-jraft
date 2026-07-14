@@ -161,6 +161,45 @@ public class BallotBoxTest {
     }
 
     @Test
+    public void testRollbackLastCommittedIndexBranchSwitch() {
+        Mockito.when(this.waiter.hasAvailableCapacity(1)).thenReturn(true);
+        assertTrue(this.box.setLastCommittedIndex(254));
+        assertEquals(254, this.box.getLastCommittedIndex());
+        assertFalse(this.box.setLastCommittedIndex(14));
+        assertEquals(254, this.box.getLastCommittedIndex());
+
+        assertTrue(this.box.rollbackLastCommittedIndex(14));
+        assertEquals(14, this.box.getLastCommittedIndex());
+        assertTrue(this.box.resetPendingIndex(15));
+        assertEquals(15, this.box.getPendingIndex());
+    }
+
+    @Test
+    public void testRollbackLastCommittedIndexForwardIsNoOp() {
+        Mockito.when(this.waiter.hasAvailableCapacity(1)).thenReturn(true);
+        assertTrue(this.box.setLastCommittedIndex(10));
+        assertTrue(this.box.rollbackLastCommittedIndex(20));
+        assertEquals(10, this.box.getLastCommittedIndex());
+        assertTrue(this.box.rollbackLastCommittedIndex(10));
+        assertEquals(10, this.box.getLastCommittedIndex());
+    }
+
+    @Test
+    public void testRollbackLastCommittedIndexRefusedWhileLeader() {
+        assertTrue(this.box.resetPendingIndex(1));
+        assertTrue(this.box.appendPendingTask(
+            JRaftUtils.getConfiguration("localhost:8081,localhost:8082,localhost:8083"),
+            JRaftUtils.getConfiguration("localhost:8081"), new Closure() {
+
+                @Override
+                public void run(Status status) {
+
+                }
+            }));
+        assertFalse(this.box.rollbackLastCommittedIndex(0));
+    }
+
+    @Test
     public void testSetLastCommittedIndex() {
         Mockito.when(this.waiter.hasAvailableCapacity(1)).thenReturn(true);
         assertEquals(0, this.box.getLastCommittedIndex());

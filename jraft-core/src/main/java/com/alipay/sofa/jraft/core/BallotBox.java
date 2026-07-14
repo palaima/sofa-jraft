@@ -259,6 +259,35 @@ public class BallotBox implements Lifecycle<BallotBoxOptions>, Describer {
         return true;
     }
 
+    /**
+     * Roll back follower committed state after a branch-switch snapshot install.
+     * The normal committed-index path is monotonic, but a leader snapshot can move
+     * a follower off a divergent branch to a lower index.
+     *
+     * @param lastCommittedIndex the installed snapshot's last included index
+     * @return true unless pending leader tasks make rollback unsafe
+     */
+    boolean rollbackLastCommittedIndex(final long lastCommittedIndex) {
+        final long stamp = this.stampedLock.writeLock();
+        try {
+            if (this.pendingIndex != 0 || !this.pendingMetaQueue.isEmpty()) {
+                LOG.error("Node {} refuses to roll back lastCommittedIndex to {}, pendingIndex={}, "
+                          + "pendingMetaQueueSize={}.", this.opts.getNodeId(), lastCommittedIndex, this.pendingIndex,
+                    this.pendingMetaQueue.size());
+                return false;
+            }
+            if (lastCommittedIndex >= this.lastCommittedIndex) {
+                return true;
+            }
+            LOG.warn("Node {} rolls back lastCommittedIndex from {} to {} on branch-switch snapshot install.",
+                this.opts.getNodeId(), this.lastCommittedIndex, lastCommittedIndex);
+            this.lastCommittedIndex = lastCommittedIndex;
+            return true;
+        } finally {
+            this.stampedLock.unlockWrite(stamp);
+        }
+    }
+
     @Override
     public void shutdown() {
         clearPendingTasks();

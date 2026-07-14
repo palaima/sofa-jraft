@@ -1298,7 +1298,15 @@ public class NodeImpl implements Node, RaftServerService {
         }
 
         // init commit manager
-        this.ballotBox.resetPendingIndex(this.logManager.getLastLogIndex() + 1);
+        if (!this.ballotBox.resetPendingIndex(this.logManager.getLastLogIndex() + 1)) {
+            // Without a pending index, new entries cannot be tracked safely.
+            // Step down instead of advertising a stale committed index.
+            LOG.error("Node {} fail to reset pending index when becoming leader, term={}, lastLogIndex={}.",
+                getNodeId(), this.currTerm, this.logManager.getLastLogIndex());
+            stepDown(this.currTerm, false, new Status(RaftError.EINTERNAL,
+                "Fail to reset ballot box pending index when becoming leader."));
+            return;
+        }
         // Register _conf_ctx to reject configuration changing before the first log
         // is committed.
         if (this.confCtx.isBusy()) {
@@ -3499,8 +3507,14 @@ public class NodeImpl implements Node, RaftServerService {
         }
     }
 
-    public void updateConfigurationAfterInstallingSnapshot() {
+    public void updateConfigurationAfterInstallingSnapshot(final long lastIncludedIndex) {
         checkAndSetConfiguration(false);
+        // Branch-switch snapshots can move committed state backward; keep the
+        // ballot box aligned with the loaded snapshot. A negative index means load
+        // failed. During boot, this hook runs before initBallotBox(), so skip it.
+        if (lastIncludedIndex >= 0 && this.ballotBox != null) {
+            this.ballotBox.rollbackLastCommittedIndex(lastIncludedIndex);
+        }
     }
 
     private void stopReplicator(final Collection<PeerId> keep, final Collection<PeerId> drop) {

@@ -87,10 +87,15 @@ public class Replicator implements ThreadId.OnError {
 
     private static final Logger              LOG                    = LoggerFactory.getLogger(Replicator.class);
 
+    private static final int                 INSTALL_SNAPSHOT_REJECT_ALERT_COUNT = 5;
+
     private final RaftClientService          rpcService;
     // Next sending log index
     private volatile long                    nextIndex;
     private int                              consecutiveErrorTimes  = 0;
+    // Track repeated probe rejects after a successful snapshot install.
+    private volatile long                    lastInstalledSnapshotIndex = -1;
+    private int                              appendRejectsAfterInstall  = 0;
     private boolean                          hasSucceeded;
     private long                             timeoutNowIndex;
     private volatile long                    lastRpcSendTimestamp;
@@ -738,6 +743,8 @@ public class Replicator implements ThreadId.OnError {
             }
             // success
             r.nextIndex = request.getMeta().getLastIncludedIndex() + 1;
+            r.lastInstalledSnapshotIndex = request.getMeta().getLastIncludedIndex();
+            r.appendRejectsAfterInstall = 0;
             sb.append(" success=true");
             LOG.info(sb.toString());
         } while (false);
@@ -1491,6 +1498,15 @@ public class Replicator implements ThreadId.OnError {
             }
             // Fail, reset the state to try again from nextIndex.
             r.resetInflights();
+            if (r.lastInstalledSnapshotIndex >= 0 && request.getPrevLogIndex() == r.lastInstalledSnapshotIndex
+                && ++r.appendRejectsAfterInstall % INSTALL_SNAPSHOT_REJECT_ALERT_COUNT == 0) {
+                LOG.error(
+                    "Peer={} rejected AppendEntries at prevLogIndex={} after snapshot install at that index "
+                            + "(rejectCount={}, remote lastLogIndex={}, groupId={}). "
+                            + "Check follower snapshot/log consistency.",
+                    r.options.getPeerId(), request.getPrevLogIndex(), r.appendRejectsAfterInstall,
+                    response.getLastLogIndex(), r.options.getGroupId());
+            }
             // prev_log_index and prev_log_term doesn't match
             if (response.getLastLogIndex() + 1 < r.nextIndex) {
                 LOG.debug("LastLogIndex at peer={} is {}", r.options.getPeerId(), response.getLastLogIndex());
@@ -1511,6 +1527,7 @@ public class Replicator implements ThreadId.OnError {
             r.sendProbeRequest();
             return false;
         }
+        r.appendRejectsAfterInstall = 0;
         if (isLogDebugEnabled) {
             sb.append(", success");
             LOG.debug(sb.toString());
